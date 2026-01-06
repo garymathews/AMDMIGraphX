@@ -1,0 +1,29 @@
+name: 'Setup'
+description: 'Setup build environment'
+
+inputs:
+  GITHUB_TOKEN:
+    required: true
+
+outputs:
+  short-sha:
+    value: ${{ steps.create-short-sha.outputs.SHORT_SHA }}
+  version:
+    value: ${{ github.ref_type == 'tag' && github.ref_name || steps.create-short-sha.outputs.SHORT_SHA }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: lowercaseRepo
+      uses: ASzc/change-string-case-action@v5
+      with:
+        string: ${{ github.repository }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver: docker
+
+    - id: create-short-sha
+      run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+      shell: bash

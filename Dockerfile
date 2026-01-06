@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM ubuntu:22.04 AS base
 
 ARG PREFIX=/usr/local
 
@@ -14,9 +14,6 @@ RUN sh -c 'echo deb [arch=amd64 trusted=yes] http://repo.radeon.com/rocm/apt/7.1
 
 # From docs.amd.com for installing rocm. Needed to install properly
 RUN sh -c "echo 'Package: *\nPin: release o=repo.radeon.com\nPin-priority: 600' > /etc/apt/preferences.d/rocm-pin-600"
-
-# rocgdb doesn't work on 22.04, workaround by installing the older python packages that are in 20.04
-RUN add-apt-repository -y ppa:deadsnakes/ppa
 
 # Install dependencies
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated \
@@ -104,19 +101,12 @@ COPY ./tools/requirements-py.txt /requirements-py.txt
 RUN /install_prereqs.sh /usr/local / && rm /install_prereqs.sh && rm /requirements-py.txt
 RUN test -f /usr/local/hash || exit 1
 
-# Install yapf
-RUN pip3 install yapf==0.28.0
-
-# Install doc requirements
-ADD docs/sphinx/requirements.txt /doc-requirements.txt
-RUN pip3 install -r /doc-requirements.txt
-
-# Install latest ccache version
-RUN cget -p $PREFIX install facebook/zstd@v1.4.5 -X subdir -DCMAKE_DIR=build/cmake
-RUN cget -p $PREFIX install ccache@v4.1 -DENABLE_TESTING=OFF
-RUN cget -p /opt/cmake install kitware/cmake@v3.28.0
-# Install a newer version of doxygen because the one that comes with ubuntu is broken
-RUN cget -p $PREFIX install doxygen@Release_1_14_0
+# Install cmake
+ARG CMAKE=3.31.10
+RUN wget https://github.com/Kitware/CMake/releases/download/v$CMAKE/cmake-$CMAKE-Linux-x86_64.tar.gz && \
+    tar -xzf cmake-$CMAKE-Linux-x86_64.tar.gz -C /opt && \
+    rm cmake-$CMAKE-Linux-x86_64.tar.gz
+ENV PATH="/opt/cmake-$CMAKE-linux-x86_64/bin:$PATH"
 
 COPY ./test/onnx/.onnxrt-commit /
 
@@ -129,11 +119,6 @@ RUN git clone --single-branch --branch ${ONNXRUNTIME_BRANCH} --recursive ${ONNXR
     if [ -z "$ONNXRUNTIME_COMMIT" ] ; then git checkout $(cat /.onnxrt-commit) ; else git checkout ${ONNXRUNTIME_COMMIT} ; fi && \
     /bin/sh /onnxruntime/dockerfiles/scripts/install_common_deps.sh
 
-
-ADD tools/build_and_test_onnxrt.sh /onnxruntime/build_and_test_onnxrt.sh
-ADD tools/pai_test_launcher.sh /onnxruntime/tools/ci_build/github/pai/pai_test_launcher.sh
-ADD tools/pai_provider_test_launcher.sh /onnxruntime/tools/ci_build/github/pai/pai_provider_test_launcher.sh
-
 ENV MIOPEN_FIND_DB_PATH=/tmp/miopen/find-db
 ENV MIOPEN_USER_DB_PATH=/tmp/miopen/user-db
 ENV LD_LIBRARY_PATH=$PREFIX/lib
@@ -144,3 +129,52 @@ ENV UBSAN_OPTIONS=print_stacktrace=1
 # See: https://github.com/google/sanitizers/issues/1017
 ENV ASAN_OPTIONS=detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1
 RUN ln -s /opt/rocm/llvm/bin/llvm-symbolizer /usr/bin/llvm-symbolizer
+
+FROM base AS build
+
+WORKDIR /code
+RUN apt install -qq -y libomp-dev
+RUN git clone --depth 1 --branch v1.8.1 https://github.com/uxlfoundation/oneDNN.git dnnl && \
+    cd dnnl && mkdir build && mkdir out && cd build && \
+    CXX=/opt/rocm/llvm/bin/clang++ CC=/opt/rocm/llvm/bin/clang cmake .. \
+        -DCMAKE_INSTALL_PREFIX=/code/dnnl/out \
+        -DDNNL_BUILD_EXAMPLES=OFF \
+        -DNNL_BUILD_TESTS=OFF \
+        -DDNNL_CPU_RUNTIME=OMP \
+        -DDNNL_ARCH_OPT_FLAGS="-march=znver2" \
+        -DONEDNN_BUILD_GRAPH=ON && \
+    make -j && \
+    make install
+
+WORKDIR /code
+RUN git clone --recursive --branch cpp-3.3.0 https://github.com/msgpack/msgpack-c.git msgpack && \
+    cd msgpack && mkdir build && mkdir out && cd build && \
+    CXX=/opt/rocm/llvm/bin/clang++ CC=/opt/rocm/llvm/bin/clang cmake .. \
+        -DCMAKE_INSTALL_PREFIX=/code/msgpack/out \
+        -DMSGPACK_BUILD_EXAMPLES=OFF \
+        -DMSGPACK_BUILD_TESTS=OFF && \
+    make -j && \
+    make install
+
+WORKDIR /code/AMDMIGraphX
+COPY . .
+RUN mkdir build && mkdir out && cd build && \
+    CXX=/opt/rocm/llvm/bin/clang++ CC=/opt/rocm/llvm/bin/clang cmake .. \
+        -DCMAKE_INSTALL_PREFIX=/code/AMDMIGraphX/out \
+        -DCMAKE_BUILD_TYPE=release \
+        -DGPU_TARGETS="gfx900;gfx908;gfx90a;gfx942;gfx950;gfx1030;gfx1100;gfx1101;gfx1200;gfx1201" \
+        -DBUILD_TESTING=OFF \
+        -DMIGRAPHX_ENABLE_CPU=ON \
+        -DMIGRAPHX_USE_COMPOSABLEKERNEL=ON && \
+    make -j && \
+    make install
+
+# Include DNNL libraries
+RUN apt install -qq -y rsync && \
+    rsync -avPH /code/dnnl/out/ /code/AMDMIGraphX/out/
+
+WORKDIR /
+RUN tar -czvf out.tar.gz -C /code/AMDMIGraphX/out/ .
+
+FROM scratch
+COPY --from=build /out.tar.gz /
