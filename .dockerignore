@@ -1,10 +1,4 @@
-# Ignore everything
-**
-
-# Allow files and directories
-!*.txt
-!*.ini
-!/tools/*.txt
-!/tools/*.sh
-!/test/onnx/.onnxrt-commit
-!/docs/sphinx/*.txt
+.githooks
+.github
+out
+Dockerfile
