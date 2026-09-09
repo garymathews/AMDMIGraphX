@@ -111,7 +111,7 @@ ENV PATH="/opt/cmake-$CMAKE-linux-x86_64/bin:$PATH"
 COPY ./test/onnx/.onnxrt-commit /
 
 ARG ONNXRUNTIME_REPO=https://github.com/Microsoft/onnxruntime
-ARG ONNXRUNTIME_BRANCH=v1.28.0
+ARG ONNXRUNTIME_BRANCH=v1.29.0
 ARG ONNXRUNTIME_COMMIT
 
 RUN git clone --depth 1 --branch ${ONNXRUNTIME_BRANCH} --recursive ${ONNXRUNTIME_REPO} onnxruntime && \
