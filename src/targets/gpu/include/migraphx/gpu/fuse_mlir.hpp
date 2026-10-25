@@ -42,6 +42,7 @@ struct MIGRAPHX_GPU_EXPORT fuse_mlir
     context* ctx      = nullptr;
     bool enable_extra = false;
     bool enable_geg_multi_out_intermediates = false;
+    bool fast_math                          = false;
     std::string name() const { return "gpu::fuse_mlir"; }
     void apply(module_pass_manager& mpm) const;
 };

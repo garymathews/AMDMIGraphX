@@ -66,6 +66,12 @@ MIGRAPHX_GPU_EXPORT instruction_ref insert_mlir(module& m,
                                                 code_object_op co,
                                                 const std::vector<instruction_ref>& inputs);
 
+// Insert a compiled stage, preserving all input/output fills and output aliases.
+MIGRAPHX_GPU_EXPORT instruction_ref insert_mlir(module& m,
+                                                instruction_ref ins,
+                                                const mlir_code_object& compiled,
+                                                std::vector<instruction_ref> inputs);
+
 MIGRAPHX_GPU_EXPORT tuning_config get_tuning_config_mlir(const context& migraphx_ctx,
                                                          module m,
                                                          const std::vector<shape>& inputs,

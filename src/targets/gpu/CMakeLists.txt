@@ -174,6 +174,7 @@ add_library(migraphx_gpu
     no_device.cpp
     nonzero.cpp
     pack_args.cpp
+    packed_conv.cpp
     prefuse_ops.cpp
     prepare_reduce.cpp
     perfdb.cpp

@@ -237,7 +237,7 @@ std::vector<pass> target::get_passes(migraphx::context& gctx, const compile_opti
         enable_pass(enabled(MIGRAPHX_ENABLE_CK{}), fuse_ck{}),
 #endif
         dead_code_elimination{},
-        enable_pass(mlir_enabled() and disabled(MIGRAPHX_ENABLE_FULL_DYNAMIC{}), fuse_mlir{&ctx}),
+        enable_pass(mlir_enabled() and disabled(MIGRAPHX_ENABLE_FULL_DYNAMIC{}), fuse_mlir{.ctx = &ctx, .fast_math = options.fast_math}),
         dead_code_elimination{},
         fuse_concat{},
         dead_code_elimination{},

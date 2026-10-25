@@ -34,6 +34,9 @@
 #include <migraphx/gpu/code_object_op.hpp>
 #include <migraphx/gpu/mlir.hpp>
 #include <migraphx/gpu/compile_pointwise.hpp>
+#include <migraphx/gpu/packed_conv.hpp>
+#include <migraphx/program.hpp>
+#include <memory>
 
 namespace migraphx {
 inline namespace MIGRAPHX_INLINE_NS {
@@ -135,6 +138,44 @@ static instruction_ref find_final_split(instruction_ref split_ins)
     return *it;
 }
 
+instruction_ref insert_mlir(module& m,
+                            instruction_ref ins,
+                            const mlir_code_object& compiled,
+                            std::vector<instruction_ref> inputs)
+{
+    // Kernels receive flattened arguments, but retain the output tuple's alias.
+    assert(std::all_of(inputs.begin(), inputs.end() - 1, [](auto input) {
+        return input->get_shape().sub_shapes().empty();
+    }));
+    const auto output_index = inputs.size() - 1;
+    const bool multi_output = not inputs.back()->get_shape().sub_shapes().empty();
+    std::vector<instruction_ref> output_fills;
+    for(auto i : range(compiled.prefill_indices.size()))
+    {
+        const auto index         = compiled.prefill_indices[i];
+        const bool tuple_element = multi_output and index >= output_index;
+        auto buffer =
+            tuple_element
+                ? m.insert_instruction(ins,
+                                       make_op("get_tuple_elem", {{"index", index - output_index}}),
+                                       inputs.back())
+                : inputs.at(index);
+        auto filled = m.insert_instruction(
+            ins, make_op("hip::fill", {{"value", compiled.prefill_values.at(i)}}), buffer);
+        if(tuple_element)
+            output_fills.push_back(filled);
+        else
+            replace(inputs, buffer, filled);
+    }
+    if(not output_fills.empty())
+    {
+        // Preserve the tuple and make the kernel depend on every output fill.
+        output_fills.insert(output_fills.begin(), inputs.back());
+        inputs.back() = m.insert_instruction(ins, make_op("identity"), output_fills);
+    }
+    return insert_mlir(m, ins, compiled.cop, inputs);
+}
+
 struct mlir_compiler : compiler<mlir_compiler>
 {
     std::vector<std::string> names() const { return {"gpu::mlir_op"}; }
@@ -199,10 +240,22 @@ struct mlir_compiler : compiler<mlir_compiler>
         }
     }
 
-    compiler_replace
-    compile(context& ctx, instruction_ref ins, const operation&, const value& solution) const
+    compiler_replace compile(context& ctx,
+                             instruction_ref ins,
+                             const operation& op,
+                             const value& configuration) const
     {
-        auto* smod = ins->module_inputs().front();
+        const auto provider = configuration.is_object() ? configuration.get("provider", "") : "";
+        if(contains({"packed_conv", "rocmlir_pair"}, provider) and
+           not op.to_value().get("fast_math", false))
+            MIGRAPHX_THROW("Packed convolution requires fast_math FP32 fusion permission");
+        if(provider == "packed_conv")
+            return compile_packed_conv(
+                ctx, *ins->module_inputs().front(), to_shapes(ins->inputs()), configuration);
+        if(provider == "rocmlir_pair")
+            return compile_head_pair(ctx, ins, configuration);
+        const auto& solution = provider == "rocmlir" ? configuration.at("config") : configuration;
+        auto* smod           = ins->module_inputs().front();
         assert(smod->get_parameter_names().size() == ins->inputs().size() - 1);
         auto gemm_like_ins = std::find_if(smod->begin(), smod->end(), [&](const auto& i) {
             return contains({"dot", "quant_dot", "convolution", "quant_convolution"}, i.name());
@@ -214,7 +267,7 @@ struct mlir_compiler : compiler<mlir_compiler>
         // check if (a) module is fused (b) contains a "gemm/conv" instruction and (c)
         // perfConfig can not allow fused module
         if(gemm_like_ins != smod->end() and pointwise_ins != smod->end() and
-           not is_module_fusible(*smod, ctx, solution))
+           solution.if_string() != nullptr and not is_module_fusible(*smod, ctx, solution))
         {
             auto input_args = ins->inputs();
             // remove alloc buffer
@@ -236,7 +289,7 @@ struct mlir_compiler : compiler<mlir_compiler>
             }
             assert(pw_shapes.back() == ins->get_shape());
             auto cop2 = compile_pointwise_module(ctx, pw_shapes, &mod_splits[1].mod);
-            std::vector<mlir_code_object> cops = {cop1, mlir_code_object{cop2}};
+            std::array<compiler_replace, 2> cops = {insert(cop1), insert(mlir_code_object{cop2})};
             return insert(cops, mod_splits, ins, split_ins);
         }
         auto cr = insert(compile_mlir(ctx, *smod, to_shapes(ins->inputs()), solution));
@@ -244,139 +297,107 @@ struct mlir_compiler : compiler<mlir_compiler>
         return cr;
     }
 
+    compiler_replace
+    compile_head_pair(context& ctx, instruction_ref ins, const value& solution) const
+    {
+        auto* smod         = ins->module_inputs().front();
+        const auto problem = analyze_packed_conv(*smod, to_shapes(ins->inputs()));
+        if(not problem or not problem->pointwise)
+            MIGRAPHX_THROW("Unsupported two-stage packed convolution fallback");
+        auto inputs = ins->inputs();
+        inputs.pop_back();
+        auto mods    = smod->split(inputs, {problem->activation});
+        auto staging = std::make_shared<program>();
+        std::array<compiler_replace, 2> kernels;
+        for(std::size_t i = 0; i < mods.size(); ++i)
+        {
+            auto shapes = to_shapes(mods[i].inputs);
+            shapes.push_back(mods[i].mod.get_output_shapes().front());
+            auto* body = staging->create_module("stage" + std::to_string(i), mods[i].mod);
+            auto* mm   = staging->get_main_module();
+            std::vector<instruction_ref> args;
+            for(std::size_t j = 0; j < shapes.size(); ++j)
+                args.push_back(mm->add_parameter(
+                    "stage" + std::to_string(i) + "_x" + std::to_string(j), shapes[j]));
+            auto stage = mm->add_instruction(
+                make_op("gpu::precompile_op", {{"output_shape", to_value(shapes.back())}}),
+                args,
+                {body});
+            kernels[i] = compile(ctx,
+                                 stage,
+                                 make_op("gpu::mlir_op", {{"fast_math", true}}),
+                                 solution.at(i == 0 ? "first" : "second"));
+        }
+        return insert(kernels, mods, ins, problem->activation, staging);
+    }
+
     compiler_replace insert(const mlir_code_object& mco) const
     {
         return {std::vector<operation>{mco.cop},
                 [=](module& m, instruction_ref ins, const std::vector<operation>& ops) {
-                    std::vector<instruction_ref> inputs = ins->inputs();
-
-                    // Tuple inputs not supported
-                    assert(std::all_of(inputs.begin(), inputs.end() - 1, [](auto i) {
-                        return i->get_shape().sub_shapes().empty();
-                    }));
-
-                    // Multiple output case (allocate ins will give a tuple)
-                    std::vector<instruction_ref> flat_inputs(inputs);
-                    bool multi_out = not flat_inputs.back()->get_shape().sub_shapes().empty();
-                    if(multi_out)
-                    {
-                        auto allocs = flat_inputs.back();
-                        flat_inputs.pop_back();
-                        auto sub_shape_idx = range(allocs->get_shape().sub_shapes().size());
-                        std::transform(sub_shape_idx.begin(),
-                                       sub_shape_idx.end(),
-                                       std::back_inserter(flat_inputs),
-                                       [&](int i) {
-                                           return m.insert_instruction(
-                                               ins,
-                                               migraphx::make_op("get_tuple_elem", {{"index", i}}),
-                                               allocs);
-                                       });
-                    }
-                    std::vector<instruction_ref> tuple_replacements;
-
-                    for(const auto i : range(mco.prefill_indices.size()))
-                    {
-                        auto prefilled_ins = m.insert_instruction(
-                            ins,
-                            migraphx::make_op("hip::fill", {{"value", mco.prefill_values[i]}}),
-                            flat_inputs[mco.prefill_indices[i]]);
-                        if(not multi_out or mco.prefill_indices[i] < inputs.size() - 1)
-                        {
-                            replace(inputs, inputs[mco.prefill_indices[i]], prefilled_ins);
-                        }
-                        else
-                        {
-                            tuple_replacements.push_back(prefilled_ins);
-                        }
-                    }
-
-                    if(multi_out and not tuple_replacements.empty())
-                    {
-                        // Add identity to make sure fill operations happen before kernel call
-                        tuple_replacements.insert(tuple_replacements.begin(), inputs.back());
-                        inputs.back() = m.insert_instruction(
-                            ins, migraphx::make_op("identity"), tuple_replacements);
-                    }
-
-                    auto mlir = insert_mlir(m, ins, any_cast<code_object_op>(ops.front()), inputs);
-                    return m.replace_instruction(ins, mlir);
+                    auto compiled = mco;
+                    compiled.cop  = any_cast<code_object_op>(ops.front());
+                    return m.replace_instruction(ins, insert_mlir(m, ins, compiled, ins->inputs()));
                 },
                 &trace};
     }
 
-    compiler_replace insert(const std::vector<mlir_code_object>& mcos,
+    compiler_replace insert(const std::array<compiler_replace, 2>& stages,
                             const std::array<module_with_inputs, 2>& mods,
                             instruction_ref precompile_ins,
-                            instruction_ref split_ins) const
+                            instruction_ref split_ins,
+                            std::shared_ptr<program> lifetime = nullptr) const
     {
-        std::vector<operation> cobjs(mcos.size());
-        std::transform(
-            mcos.begin(), mcos.end(), cobjs.begin(), [](const auto& mco) { return mco.cop; });
-        auto precompiled_inputs = precompile_ins->inputs();
+        std::vector<operation> objects;
+        for(const auto& stage : stages)
+            objects.insert(objects.end(), stage.code_objects.begin(), stage.code_objects.end());
+        auto original_inputs = precompile_ins->inputs();
         return {
-            cobjs, [=](module& m, instruction_ref ins, const std::vector<operation>& ops) {
-                auto compiled_inputs = ins->inputs();
-                std::unordered_map<instruction_ref, instruction_ref> inputs_rep_map;
-                for(const auto i : range(precompiled_inputs.size()))
-                {
-                    inputs_rep_map[precompiled_inputs[i]] = compiled_inputs[i];
-                }
-                auto dot_inputs        = mods[0].inputs;
-                auto dot_mod_out_shape = mods[0].mod.get_output_shapes().front();
-                auto dot_alloc         = m.insert_instruction(
+            objects, [=](module& m, instruction_ref ins, const std::vector<operation>& ops) {
+                // Stage compilers may retain references to their source program.
+                [[maybe_unused]] const auto keep_alive = lifetime;
+                std::unordered_map<instruction_ref, instruction_ref> replacements;
+                for(auto i : range(original_inputs.size()))
+                    replacements[original_inputs[i]] = ins->inputs()[i];
+                const auto remap = [&](std::vector<instruction_ref> inputs) {
+                    for(auto& input : inputs)
+                        if(auto found = replacements.find(input); found != replacements.end())
+                            input = found->second;
+                    return inputs;
+                };
+                auto first_inputs      = remap(mods[0].inputs);
+                const auto first_shape = mods[0].mod.get_output_shapes().front();
+                first_inputs.push_back(m.insert_instruction(
+                    ins, make_op("hip::allocate", {{"shape", to_value(first_shape)}})));
+                auto first = m.insert_instruction(
                     ins,
-                    migraphx::make_op("hip::allocate", {{"shape", to_value(dot_mod_out_shape)}}));
-                dot_inputs.push_back(dot_alloc);
-                for(const auto i : range(mcos[0].prefill_indices.size()))
+                    make_op("gpu::precompile_op", {{"output_shape", to_value(first_shape)}}),
+                    first_inputs);
+                auto second_module = mods[1];
+                second_module.replace(split_ins, first);
+                auto second_inputs = remap(second_module.inputs);
+                second_inputs.push_back(ins->inputs().back());
+                auto second = m.insert_instruction(
+                    ins,
+                    make_op("gpu::precompile_op", {{"output_shape", to_value(ins->get_shape())}}),
+                    second_inputs);
+                // Keep real consumers attached while each compiler rewires its stage.
+                m.replace_instruction(ins, make_op("identity"), {second});
+                std::size_t offset = 0;
+                for(auto i : range(stages.size()))
                 {
-                    auto prefilled_ins = m.insert_instruction(
-                        ins,
-                        migraphx::make_op("hip::fill", {{"value", mcos[0].prefill_values[i]}}),
-                        dot_inputs[mcos[0].prefill_indices[i]]);
-                    replace(dot_inputs, dot_inputs[mcos[0].prefill_indices[i]], prefilled_ins);
+                    auto compiled = stages[i];
+                    compiled.code_objects.assign(
+                        ops.begin() + offset, ops.begin() + offset + compiled.code_objects.size());
+                    offset += compiled.code_objects.size();
+                    compiled.replace(m, i == 0 ? first : second);
                 }
-
-                std::vector<instruction_ref> dot_inputs_updated;
-                std::transform(dot_inputs.begin(),
-                               dot_inputs.end(),
-                               std::back_inserter(dot_inputs_updated),
-                               [&](const auto& i) {
-                                   if(inputs_rep_map.find(i) != inputs_rep_map.end())
-                                   {
-                                       assert(inputs_rep_map.at(i)->get_shape() == i->get_shape());
-                                       return inputs_rep_map.at(i);
-                                   }
-                                   return i;
-                               });
-                auto mlir_ins =
-                    insert_mlir(m, ins, any_cast<code_object_op>(ops[0]), dot_inputs_updated);
-                auto pwm = mods[1];
-                pwm.replace(split_ins, mlir_ins);
-                auto pw_inputs = pwm.inputs;
-                pw_inputs.push_back(ins->inputs().back());
-                std::vector<instruction_ref> pw_inputs_updated;
-                std::transform(pw_inputs.begin(),
-                               pw_inputs.end(),
-                               std::back_inserter(pw_inputs_updated),
-                               [&](const auto& i) {
-                                   if(inputs_rep_map.find(i) != inputs_rep_map.end())
-                                   {
-                                       assert(inputs_rep_map.at(i)->get_shape() == i->get_shape());
-                                       return inputs_rep_map.at(i);
-                                   }
-                                   return i;
-                               });
-                auto pw_ins =
-                    insert_mlir(m, ins, any_cast<code_object_op>(ops[1]), pw_inputs_updated);
-                return m.replace_instruction(ins, pw_ins);
+                return m.replace_instruction(ins, ins->inputs().front());
             }};
     }
 
-    optional<tuning_config> get_tuning_config(const context& ctx,
-                                              instruction_ref ins,
-                                              const operation&,
-                                              bool exhaustive) const
+    optional<tuning_config>
+    get_tuning_config(context& ctx, instruction_ref ins, const operation& op, bool exhaustive) const
     {
         static const auto mxr_loc  = string_value_of(MIGRAPHX_MLIR_DUMP_TO_MXR{});
         static const auto mlir_loc = string_value_of(MIGRAPHX_MLIR_DUMP{});
@@ -391,6 +412,9 @@ struct mlir_compiler : compiler<mlir_compiler>
         {
             dump_mlir_to_file(*smod, shapes, mlir_loc);
         }
+        if(auto packed = get_packed_conv_tuning_config(
+               ctx, ins, exhaustive, op.to_value().get("fast_math", false)))
+            return packed;
         return get_tuning_config_mlir(ctx, *smod, shapes, exhaustive);
     }
 

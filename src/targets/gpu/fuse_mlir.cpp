@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  */
 #include <migraphx/gpu/fuse_mlir.hpp>
+#include <migraphx/gpu/packed_conv.hpp>
 #include <migraphx/gpu/mlir.hpp>
 #include <migraphx/matcher.hpp>
 #include <migraphx/pass_manager.hpp>
@@ -148,13 +149,18 @@ bool mlir_attention_enabled(context* ctx)
 struct mlir_op
 {
     std::string name() const { return "gpu::mlir_op"; }
-    operation op = make_op("convolution");
+    operation op    = make_op("convolution");
+    bool fast_math  = false;
+    bool gpu_tuning = false;
 
     template <class Self, class F>
     static auto reflect(Self& self, F f)
     {
-        return pack(f(self.op, "op"));
+        return pack(
+            f(self.op, "op"), f(self.fast_math, "fast_math"), f(self.gpu_tuning, "gpu_tuning"));
     }
+
+    value attributes() const { return {{"gpu_tuning", gpu_tuning}}; }
 
     // Check if the shape can be created from a transpose/broadcast/slice
     static bool is_mlir_compatible(const shape& s)
@@ -1467,6 +1473,69 @@ struct find_channel_slice_convolution
     }
 };
 
+// Merge only the validated single-consumer head. Keep both operations in the
+// submodule so tuning can still choose the ordinary two-stage implementation.
+struct find_packed_conv_head
+{
+    auto matcher() const { return match::name("gpu::mlir_op"); }
+
+    void apply(module_pass_manager& mpm, const match::matcher_result& r) const
+    {
+        const auto tail = r.result;
+        if(tail->get_shape().type() != shape::half_type or tail->get_shape().elements() != 400 or
+           tail->module_inputs().size() != 1)
+            return;
+        for(auto stage : tail->inputs())
+        {
+            if(stage->name() != "gpu::mlir_op" or stage->outputs().size() != 1 or
+               stage->module_inputs().size() != 1 or
+               stage->get_shape() != shape{shape::half_type, {1, 32, 10, 10}})
+                continue;
+            module fused;
+            fused.set_bypass();
+            std::unordered_map<instruction_ref, instruction_ref> map_ins;
+            fuse_input_ops(&fused, stage->inputs(), &map_ins);
+            const auto first =
+                fused.fuse(*stage->module_inputs().front(), stage->inputs(), &map_ins);
+            if(first.size() != 1)
+                continue;
+            map_ins[stage] = first.front();
+            fuse_input_ops(&fused, tail->inputs(), &map_ins);
+            const auto last = fused.fuse(*tail->module_inputs().front(), tail->inputs(), &map_ins);
+            fused.add_return(last);
+            const auto inputs  = find_inputs(map_ins, &mpm.get_module(), &fused);
+            const auto problem = analyze_packed_conv(fused, to_shapes(inputs));
+            if(not problem or not problem->pointwise)
+                continue;
+            auto* merged = mpm.create_module(tail->module_inputs().front()->name() + "_packed_head",
+                                             std::move(fused));
+            auto attrs   = tail->get_operator().to_value();
+            attrs["gpu_tuning"] = true;
+            mpm.get_module().replace_instruction(
+                tail, make_op("gpu::mlir_op", attrs), inputs, {merged});
+            return;
+        }
+    }
+};
+
+void fuse_packed_conv_heads(module_pass_manager& mpm, context& ctx, bool fast_math)
+{
+    if(not fast_math or not packed_conv_supported(ctx))
+        return;
+    for(auto ins : iterator_for(mpm.get_module()))
+    {
+        if(ins->name() != "gpu::mlir_op")
+            continue;
+        auto attrs         = ins->get_operator().to_value();
+        attrs["fast_math"] = true;
+        mpm.get_module().replace_instruction(
+            ins, make_op("gpu::mlir_op", attrs), ins->inputs(), ins->module_inputs());
+    }
+    mpm.run_pass(dead_code_elimination{});
+    match::find_matches(mpm, find_packed_conv_head{});
+    mpm.run_pass(dead_code_elimination{});
+}
+
 } // namespace
 
 #endif // MIGRAPHX_MLIR
@@ -1538,6 +1607,8 @@ void fuse_mlir::apply(module_pass_manager& mpm) const
     match::find_matches(mpm, find_unpack_fp4_mlir_op{});
 
     match::find_matches(mpm, find_mlir_output_reshape_ops{});
+    if(ctx != nullptr)
+        fuse_packed_conv_heads(mpm, *ctx, fast_math);
 
 #else
     (void)mpm;

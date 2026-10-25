@@ -327,7 +327,15 @@ struct compile_manager
 
     void update_configs()
     {
-        par_compile(cps.size(), [&](auto i) { cps[i].update_config(exhaustive); });
+        // Shape/config discovery is parallel. Composite operations that benchmark
+        // stages must run afterward, with exclusive use of the context/cache.
+        par_compile(cps.size(), [&](auto i) {
+            if(not cps[i].preop.attributes().get("gpu_tuning", false))
+                cps[i].update_config(exhaustive);
+        });
+        for(auto& cp : cps)
+            if(cp.preop.attributes().get("gpu_tuning", false))
+                cp.update_config(exhaustive);
     }
 
     void compile(module& m)
